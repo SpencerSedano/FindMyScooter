@@ -1,6 +1,33 @@
-# editors
+# Build directories
+build/
+build-*/
+# Or more generally:
+/build*
+
+# West (nRF Connect SDK tool)
+.west/
+
+# IDE Files (VS Code)
+.vscode/
+.vs/
+.cache/
+
+# Nordic tools & Zephyr specific
+/.config
+/.config.old
+/ncs.conf
+/pristine.conf
+/build_config.py
+/Makefile
+/modules/
+/zephyr/
+/doc/
+/include/
+/lib/
+/share/
+
+# Others
+.DS_Store
 *.swp
 *~
-
-# build
-/build*/
+.clangd

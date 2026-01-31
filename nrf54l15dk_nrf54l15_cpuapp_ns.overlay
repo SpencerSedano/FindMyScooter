@@ -1,0 +1,60 @@
+/ {
+    aliases {
+        ledwhite1 = &ledwhite1;
+        ledwhite2 = &ledwhite2;
+        ledwhite3 = &ledwhite3;
+        ledwhite4 = &ledwhite4;
+        sw0 = &button0;
+    };
+
+    leds {
+        compatible = "gpio-leds";
+        
+        ledwhite1: led_1 {
+            gpios = <&gpio1 12 GPIO_ACTIVE_HIGH>;
+            label = "LED_WHITE1";
+        };
+        ledwhite2: led_2 {
+            gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
+            label = "LED_WHITE2";
+        };
+        /* CHANGED BACK TO P2.06 (Trace Clock) - Safer than P1.03 */
+        ledwhite3: led_3 {
+            gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+            label = "LED_WHITE3";
+        };
+        ledwhite4: led_4 {
+            gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>;
+            label = "LED_WHITE4";
+        };
+    }; /* Closes leds */
+
+    buttons {
+        compatible = "gpio-keys";
+        
+        button0: button_0 {
+            /* P1.13 is a common Button pin on Nordic DKs */
+            /* (GPIO_PULL_UP) ensures the pin is High when not pressed */
+            gpios = <&gpio1 13 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+            label = "Push button switch 0";
+        };
+    };
+
+    
+
+};
+&pinctrl {
+    i2s20_default: i2s20_default {
+        group1 {
+            psels = <NRF_PSEL(I2S_SCK_M, 1, 5)>,  /* BCLK */
+                    <NRF_PSEL(I2S_LRCK_M, 1, 4)>, /* LRC */
+                    <NRF_PSEL(I2S_SDOUT, 1, 6)>;  /* DIN */
+        };
+    };
+};
+
+&i2s20 {
+    status = "okay";
+    pinctrl-0 = <&i2s20_default>;
+    pinctrl-names = "default";
+};
