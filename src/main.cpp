@@ -30,6 +30,8 @@ LOG_MODULE_REGISTER(mixed_sample, LOG_LEVEL_INF);
 // --- AUDIO MACROS ---
 #define SAMPLE_FREQ 16000
 #define BLOCK_SIZE 1024
+#define TONE_FREQ_HZ 500
+#define AUDIO_DIAG_ALWAYS_ON 1
 K_MEM_SLAB_DEFINE(i2s_mem_slab, BLOCK_SIZE, 4, 4);
 
 // --- GPIO GLOBALS ---
@@ -44,7 +46,8 @@ static struct gpio_callback button_cb_data;
 // --- I2S GLOBALS ---
 static const struct device* i2s_dev = DEVICE_DT_GET(DT_NODELABEL(i2s20));
 static void* audio_pattern_block;     // Stores the 500 Hz square wave pattern
-static bool sound_is_playing = false; // <-- NEW: State flag
+static bool sound_is_playing = false;
+static volatile bool audio_enable_requested = false;
 
 /* --- BLE CONFIGURATION (Standard) --- */
 static const struct bt_data ad[] = {
@@ -57,30 +60,65 @@ static const struct bt_data sd[] = {
     BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
 };
 
+static const struct bt_le_adv_param *adv_params = BT_LE_ADV_CONN_FAST_1;
+
 /* --- AUDIO CONTROL FUNCTION --- */
-void control_audio(bool enable) {
-  if (enable && !sound_is_playing) {
-    void* first_block;
-    
-    // Allocate a fresh block for the initial trigger
-    if (k_mem_slab_alloc(&i2s_mem_slab, &first_block, K_NO_WAIT) == 0) {
-      // Copy the template into the disposable block
-      memcpy(first_block, audio_pattern_block, BLOCK_SIZE);
-      
-      // Hand the disposable block to the driver
-      i2s_write(i2s_dev, first_block, BLOCK_SIZE);
-      i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
-      
-      sound_is_playing = true;
-      LOG_INF("Audio ON (500 Hz Square Wave)");
-    }
+static void request_audio_state(bool enable) {
+  audio_enable_requested = enable;
+}
+
+static int i2s_submit_block(k_timeout_t alloc_timeout) {
+  void* block;
+  int ret = k_mem_slab_alloc(&i2s_mem_slab, &block, alloc_timeout);
+  if (ret < 0) {
+    // This typically means all blocks are in-flight in the I2S driver queue.
+    return ret;
   }
-  else if (!enable && sound_is_playing) {
-    i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_STOP);
-    i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP); // Clear the queue
-    sound_is_playing = false;
-    LOG_INF("Audio OFF");
+
+  memcpy(block, audio_pattern_block, BLOCK_SIZE);
+
+  ret = i2s_write(i2s_dev, block, BLOCK_SIZE);
+  if (ret < 0) {
+    k_mem_slab_free(&i2s_mem_slab, block);
+    LOG_ERR("i2s_write failed: %d", ret);
+    return ret;
   }
+
+  return 0;
+}
+
+static int audio_start(void) {
+  int ret = i2s_submit_block(K_MSEC(10));
+  if (ret < 0) {
+    LOG_ERR("Initial audio block alloc/write failed: %d", ret);
+    return ret;
+  }
+
+  ret = i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
+  if (ret < 0) {
+    LOG_ERR("I2S start failed: %d", ret);
+    i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+    return ret;
+  }
+
+  sound_is_playing = true;
+  LOG_INF("Audio ON (%d Hz square wave)", TONE_FREQ_HZ);
+  return 0;
+}
+
+static void audio_stop(void) {
+  int ret = i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_STOP);
+  if (ret < 0) {
+    LOG_WRN("I2S stop failed: %d", ret);
+  }
+
+  ret = i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+  if (ret < 0) {
+    LOG_WRN("I2S drop failed: %d", ret);
+  }
+
+  sound_is_playing = false;
+  LOG_INF("Audio OFF");
 }
 
 /* --- CALLBACKS --- */
@@ -93,7 +131,7 @@ static void app_led_cb(bool led_state) {
   gpio_pin_set_dt(&led3, led_state);
 
   // Control audio based on LED state
-  control_audio(led_state);
+  request_audio_state(led_state);
 
   printk("BLE Command received: Set LEDs to %d\n", led_state);
 }
@@ -114,8 +152,11 @@ void button_pressed(const struct device* dev, struct gpio_callback* cb,
   gpio_pin_set_dt(&led2, val);
   gpio_pin_set_dt(&led3, val);
 
-  // Control audio based on LED state (val = 1 means ON)
-  control_audio(val);
+    // gpio_pin_get_dt returns logical state, so active-low press reads as 1.
+    request_audio_state(val > 0);
+
+    LOG_INF("Button logical state=%d, audio_request=%d", val,
+      audio_enable_requested ? 1 : 0);
 
   printk("Physical Button state: %d\n", val);
 }
@@ -127,7 +168,7 @@ int configure_audio() {
     return -1;
   }
 
-  struct i2s_config config;
+  struct i2s_config config = {};
   config.word_size = 16;
   config.channels = 2; // Stereo mixes to mono on MAX98357
   config.format = I2S_FMT_DATA_FORMAT_I2S;
@@ -135,7 +176,7 @@ int configure_audio() {
   config.frame_clk_freq = SAMPLE_FREQ;
   config.mem_slab = &i2s_mem_slab;
   config.block_size = BLOCK_SIZE;
-  config.timeout = 1000;
+  config.timeout = 20;
 
   int ret = i2s_configure(i2s_dev, I2S_DIR_TX, &config);
   if (ret < 0) {
@@ -151,12 +192,16 @@ int configure_audio() {
   }
 
   int16_t* buffer = (int16_t*)audio_pattern_block;
-  
-  // Square Wave Generation (True 500 Hz tone)
-  // This is the loop that generates the actual sound data!
-  for (int i = 0; i < (BLOCK_SIZE / 2); i++) {
-      buffer[i] = (i % 64 < 32) ? 16000 : -16000;
-    }
+
+  // Generate interleaved stereo frames: [L, R, L, R, ...]
+  // with identical left/right values for a mono-compatible stream.
+  const int samples_per_channel = BLOCK_SIZE / (2 * sizeof(int16_t));
+  const int half_period_samples = SAMPLE_FREQ / (2 * TONE_FREQ_HZ);
+  for (int frame = 0; frame < samples_per_channel; frame++) {
+    int16_t value = ((frame / half_period_samples) % 2 == 0) ? 16000 : -16000;
+    buffer[2 * frame] = value;
+    buffer[2 * frame + 1] = value;
+  }
 
   // Set the initial state to STOPPED
   i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_STOP);
@@ -188,8 +233,18 @@ extern "C" {
 
     /* --- 2. BLE Init --- */
     err = bt_lbs_init(&lbs_cb);
+    if (err) {
+      printk("bt_lbs_init failed (err %d)\n", err);
+      return err;
+    }
+
     err = bt_enable(NULL);
-    err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (err) {
+      printk("bt_enable failed (err %d)\n", err);
+      return err;
+    }
+
+    err = bt_le_adv_start(adv_params, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 
     if (err) {
       printk("BLE failed to start (err %d)\n", err);
@@ -204,23 +259,41 @@ extern "C" {
       printk("Audio Failed to Configure.\n");
     }
 
+#if AUDIO_DIAG_ALWAYS_ON
+    request_audio_state(true);
+    LOG_INF("AUDIO_DIAG_ALWAYS_ON enabled: forcing continuous tone");
+#endif
+
 /* --- 4. Main Loop (Audio Feeder) --- */
     while (1) {
-      if (sound_is_playing) { 
-        void* next_block;
+#if AUDIO_DIAG_ALWAYS_ON
+      audio_enable_requested = true;
+#endif
 
-        // Wait for a free block
-        if (k_mem_slab_alloc(&i2s_mem_slab, &next_block, K_FOREVER) == 0) {
-          // Copy the tone pattern into the new block
-          memcpy(next_block, audio_pattern_block, BLOCK_SIZE);
+      if (audio_enable_requested && !sound_is_playing) {
+        (void)audio_start();
+      }
 
-          // Send to I2S. This function will automatically pause this thread 
-          // if the hardware queue is full, keeping perfect timing!
-          i2s_write(i2s_dev, next_block, BLOCK_SIZE);
+      if (!audio_enable_requested && sound_is_playing) {
+        audio_stop();
+      }
+
+      if (sound_is_playing) {
+        int ret = i2s_submit_block(K_NO_WAIT);
+        if (ret == -ENOMEM) {
+          // Queue is full; let I2S drain and check control state again.
+          k_msleep(1);
+          continue;
         }
-      } else {
-        // Only sleep the thread if the audio is completely off
-        k_msleep(100);
+
+        if (ret < 0) {
+          LOG_ERR("Audio stream stalled: %d", ret);
+          audio_stop();
+          k_msleep(50);
+        }
+      }
+      else {
+        k_msleep(20);
       }
     }
     return 0;
