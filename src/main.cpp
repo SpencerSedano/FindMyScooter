@@ -9,7 +9,7 @@
 
 
  /* I2S */
-#include <string.h> // <-- FIX: Required for memcpy
+#include <string.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/logging/log.h>
 
@@ -58,17 +58,26 @@ static const struct bt_data sd[] = {
 };
 
 /* --- AUDIO CONTROL FUNCTION --- */
-// Function to start or stop the I2S peripheral
 void control_audio(bool enable) {
   if (enable && !sound_is_playing) {
-    // Write the first block to load the DMA BEFORE starting the clocks
-    i2s_write(i2s_dev, audio_pattern_block, BLOCK_SIZE);
-    i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
-    sound_is_playing = true;
-    LOG_INF("Audio ON (500 Hz Square Wave)");
+    void* first_block;
+    
+    // Allocate a fresh block for the initial trigger
+    if (k_mem_slab_alloc(&i2s_mem_slab, &first_block, K_NO_WAIT) == 0) {
+      // Copy the template into the disposable block
+      memcpy(first_block, audio_pattern_block, BLOCK_SIZE);
+      
+      // Hand the disposable block to the driver
+      i2s_write(i2s_dev, first_block, BLOCK_SIZE);
+      i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
+      
+      sound_is_playing = true;
+      LOG_INF("Audio ON (500 Hz Square Wave)");
+    }
   }
   else if (!enable && sound_is_playing) {
     i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_STOP);
+    i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP); // Clear the queue
     sound_is_playing = false;
     LOG_INF("Audio OFF");
   }
@@ -129,19 +138,25 @@ int configure_audio() {
   config.timeout = 1000;
 
   int ret = i2s_configure(i2s_dev, I2S_DIR_TX, &config);
-  if (ret < 0)
+  if (ret < 0) {
+    printk("Failed to configure I2S stream\n");
     return ret;
+  }
 
   // Create the "Beep" sound pattern once
   ret = k_mem_slab_alloc(&i2s_mem_slab, &audio_pattern_block, K_FOREVER);
-  if (ret < 0)
+  if (ret < 0) {
+    printk("Failed to allocate audio memory\n");
     return ret;
+  }
 
   int16_t* buffer = (int16_t*)audio_pattern_block;
-  // Square Wave Generation (500 Hz tone)
+  
+  // Square Wave Generation (True 500 Hz tone)
+  // This is the loop that generates the actual sound data!
   for (int i = 0; i < (BLOCK_SIZE / 2); i++) {
-    buffer[i] = (i % 32 < 16) ? 2000 : -2000;
-  }
+      buffer[i] = (i % 64 < 32) ? 16000 : -16000;
+    }
 
   // Set the initial state to STOPPED
   i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_STOP);
@@ -164,8 +179,11 @@ extern "C" {
     gpio_pin_configure_dt(&led3, GPIO_OUTPUT_INACTIVE);
 
     gpio_pin_configure_dt(&button, GPIO_INPUT);
+    
     gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_BOTH);
+
     gpio_init_callback(&button_cb_data, button_pressed, BIT(button.pin));
+
     gpio_add_callback(button.port, &button_cb_data);
 
     /* --- 2. BLE Init --- */
@@ -186,26 +204,26 @@ extern "C" {
       printk("Audio Failed to Configure.\n");
     }
 
-    /* --- 4. Main Loop (Audio Feeder) --- */
+/* --- 4. Main Loop (Audio Feeder) --- */
     while (1) {
-      if (sound_is_playing) { // Only run if the audio is active
+      if (sound_is_playing) { 
         void* next_block;
 
-        // Allocate a fresh block
+        // Wait for a free block
         if (k_mem_slab_alloc(&i2s_mem_slab, &next_block, K_FOREVER) == 0) {
-
-          // Copy the tone pattern
+          // Copy the tone pattern into the new block
           memcpy(next_block, audio_pattern_block, BLOCK_SIZE);
 
-          // Send it to I2S
+          // Send to I2S. This function will automatically pause this thread 
+          // if the hardware queue is full, keeping perfect timing!
           i2s_write(i2s_dev, next_block, BLOCK_SIZE);
         }
+      } else {
+        // Only sleep the thread if the audio is completely off
+        k_msleep(100);
       }
-
-      // Yield execution time to other threads
-      k_msleep(10);
     }
     return 0;
   }
 
-} // End extern "C"
+} 

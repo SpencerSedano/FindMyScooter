@@ -46,9 +46,9 @@
 &pinctrl {
     i2s20_default: i2s20_default {
         group1 {
-            psels = <NRF_PSEL(I2S_SCK_M, 1, 5)>,  /* BCLK */
-                    <NRF_PSEL(I2S_LRCK_M, 1, 4)>, /* LRC */
-                    <NRF_PSEL(I2S_SDOUT, 1, 6)>;  /* DIN */
+            psels = <NRF_PSEL(I2S_SCK_M, 2, 8)>,
+                    <NRF_PSEL(I2S_LRCK_M, 2, 0)>,
+                    <NRF_PSEL(I2S_SDOUT, 2, 6)>;  /* DIN */
         };
     };
 };
